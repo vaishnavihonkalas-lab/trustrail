@@ -1,0 +1,43 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'app.js'), 'utf8');
+function app(saved, unavailable=false) {
+ const elements=new Map(); const handlers={};
+ const element=()=>({value:'',innerHTML:'',textContent:'',style:{},dataset:{},focus(){},querySelector(){return element()},querySelectorAll(){return []}});
+ const storage={value:saved,getItem(){if(unavailable)throw Error('Unavailable');return this.value||null},setItem(k,v){if(unavailable)throw Error('Unavailable');this.value=v}};
+ const document={querySelector(sel){if(!elements.has(sel))elements.set(sel,element());return elements.get(sel)},addEventListener(k,f){handlers[k]=f},activeElement:null};
+ const ctx=vm.createContext({document,localStorage:storage,console,setTimeout:()=>0,clearTimeout(){},Blob,URL});
+ vm.runInContext(source,ctx);
+ return {run:s=>vm.runInContext(s,ctx),elements,storage,handlers};
+}
+const fresh=()=>{const a=app();a.run('seed();');return a};
+function scenario(t,body){test(t,()=>body(fresh()))}
+scenario('seed balances include disputed partner-held funding',a=>{assert.equal(a.run('fin().h'),75000000);assert.equal(a.run('fin().d'),1)});
+scenario('happy path confirms payout once',a=>{a.run('var o=mkDemo(5);payRes(o,"ok")');assert.equal(a.run('o.status'),'PAYMENT_CONFIRMED');assert.equal(a.run('fin().p'),25000000);assert.throws(()=>a.run('reqRel(o)'));assert.throws(()=>a.run('payRes(o,"ok")'))});
+scenario('unfunded order cannot ship',a=>{a.run('var o=mkDemo(0)');assert.throws(()=>a.run('shipNow(o,{})'));assert.equal(a.run('o.ship'),null)});
+scenario('invalid and missing proof block acceptance and release',a=>{for(const kind of ['bad','miss','conf']){a.run(`var o=mkDemo(2);evid(o,'${kind}')`);assert.equal(a.run('ok(o)'),false);assert.throws(()=>a.run('acc(o)'));assert.throws(()=>a.run('reqRel(o)'))}});
+scenario('e-way bill alone cannot authorize payment',a=>{a.run('var o=mkDemo(2)');assert.equal(a.run('Boolean(o.ewb)'),true);assert.equal(a.run('ok(o)'),false)});
+scenario('hold expires only on controlled demo clock',a=>{a.run('var o=mkDemo(3);S.t=o.holdStart+48*36e5-1;log(o,"TEST","event");recompute(o)');assert.equal(a.run('hold(o)'),'active');assert.equal(a.run('o.status'),'PROOF_SUBMITTED');a.run('S.t++;recompute(o)');assert.equal(a.run('o.status'),'RELEASE_ELIGIBLE')});
+scenario('duplicate courier events preserve payment state',a=>{a.run('var o=mkDemo(3);var before=o.holdStart;evid(o,"dup")');assert.equal(a.run('o.evts.length'),1);assert.equal(a.run('o.holdStart===before'),true);assert.equal(a.run('o.pay.st'),'none')});
+scenario('open dispute blocks clock and release',a=>{a.run('var o=mkDemo(3);raise(o,"Damaged goods","");S.t+=48*36e5;recompute(o)');assert.equal(a.run('o.status'),'DISPUTED');assert.equal(a.run('ok(o)'),false);assert.throws(()=>a.run('reqRel(o)'))});
+scenario('pre-delivery dispute accepts new evidence without auto-release',a=>{a.run('var o=mkDemo(2);raise(o,"Goods not received","");evid(o,"valid")');assert.equal(a.run('o.status'),'DISPUTED');assert.equal(a.run('o.proof'),'valid');assert.equal(a.run('ok(o)'),false);a.run('resolve(o,"seller","Verified courier evidence and acceptance")');assert.equal(a.run('o.status'),'RELEASE_ELIGIBLE')});
+scenario('review needs a written reason and valid resolution mode',a=>{a.run('var o=mkDemo(3);raise(o,"Damaged goods","")');assert.throws(()=>a.run('resolve(o,"seller"," ")'));assert.throws(()=>a.run('resolve(o,"other","reason")'));assert.equal(a.run('o.disp.st'),'open')});
+scenario('requesting evidence leaves dispute frozen',a=>{a.run('var o=mkDemo(3);raise(o,"Damaged goods","");resolve(o,"more","Please provide photos")');assert.equal(a.run('o.disp.st'),'open');assert.equal(a.run('o.status'),'DISPUTED')});
+scenario('buyer-favour resolution refunds without payout',a=>{a.run('var o=mkDemo(3);raise(o,"Damaged goods","");resolve(o,"buyer","Damage confirmed");S.role="r";A.rfd(o.id)');assert.equal(a.run('o.status'),'REFUNDED');assert.equal(a.run('o.pay.st'),'none');assert.throws(()=>a.run('reqRel(o)'));assert.equal(a.run('fin().h'),75000000)});
+scenario('timeout blocks retries until failure reconciliation',a=>{a.run('var o=mkDemo(5);var key=o.pay.key;payRes(o,"to")');assert.throws(()=>a.run('reqRel(o)'));a.run('recon(o,false);reqRel(o)');assert.equal(a.run('o.pay.n'),2);assert.equal(a.run('o.pay.key!==key'),true)});
+scenario('reconciled success cannot pay or refund again',a=>{a.run('var o=mkDemo(5);payRes(o,"to");recon(o,true)');assert.equal(a.run('o.pay.st'),'confirmed');assert.throws(()=>a.run('cancel(o)'));assert.throws(()=>a.run('reqRel(o)'))});
+scenario('confirmed payout failure allows retry',a=>{a.run('var o=mkDemo(5);payRes(o,"fail");reqRel(o)');assert.equal(a.run('o.pay.n'),2)});
+scenario('cancellation after dispatch freezes release for review',a=>{a.run('var o=mkDemo(4);cancel(o)');assert.equal(a.run('o.status'),'DISPUTED');assert.equal(a.run('ok(o)'),false)});
+scenario('pre-shipment cancellations follow correct refund path',a=>{a.run('var o=mkDemo(0);cancel(o)');assert.equal(a.run('o.status'),'CANCELLED');a.run('var o=mkDemo(1);cancel(o)');assert.equal(a.run('o.status'),'REFUND_PENDING');assert.equal(a.run('o.refund'),'pending')});
+scenario('unsafe or zero money rejected by order constructor',a=>{assert.throws(()=>a.run('mk(9999,"b","s","i",1,0)'));assert.throws(()=>a.run('mk(9999,"b","s","i",Number.MAX_SAFE_INTEGER,200)'));assert.throws(()=>a.run('mk(9999,"b","s","i",1.5,100)'))});
+scenario('calculator interprets 18 as 18 percent',a=>{a.elements.get('#c1')||a.run("$('#c1')");for(const [id,value] of [['#c1','1000000'],['#c2','18'],['#c3','60']]){a.run(`$('${id}').value='${value}'`)}a.run('A.calc()');assert.match(a.run("$('#cr').textContent"),/29,589/)});
+scenario('invalid calculator input produces an error',a=>{a.run("$('#c1').value='-1';$('#c2').value='18';$('#c3').value='60';A.calc()");assert.match(a.run("$('#cr').textContent"),/valid non-negative/)});
+scenario('guided demo opens order and stepper and completes eight steps',a=>{a.run('demoNext()');assert.equal(a.run('ui.tab'),'orders');assert.equal(a.run('ui.drawer'),true);for(let i=0;i<7;i++)a.run('demoNext()');assert.equal(a.run('S.demo.step'),8);assert.equal(a.run('S.orders[0].pay.st'),'confirmed');a.run('demoNext()');assert.equal(a.run('S.demo.step'),1)});
+scenario('receipt confirmation time remains stable after clock advance',a=>{a.run('var o=mkDemo(5);payRes(o,"ok");var paid=o.pay.confirmedAt;S.t+=48*36e5;rcpt(o)');assert.equal(a.run('o.pay.confirmedAt===paid'),true);assert.match(a.run("$('#modal').innerHTML"),new RegExp(a.run('new Date(paid).toISOString()')))});
+scenario('unpaid orders cannot generate receipts',a=>{a.run('var o=mkDemo(0)');assert.throws(()=>a.run('rcpt(o)'))});
+scenario('persistence survives reload with complete state',a=>{a.run('var o=mkDemo(5);payRes(o,"to");save()');const b=app(a.storage.value);assert.equal(b.run('S.orders[0].status'),'PAYMENT_UNKNOWN');assert.equal(b.run('S.orders.length'),4)});
+test('malformed, partial and unavailable storage recover safely',()=>{for(const saved of ['{bad','{"orders":[{}],"audit":[]}',JSON.stringify({orders:[],audit:[],t:0,seq:1004,role:'unknown'})]){assert.equal(app(saved).run('S.orders.length'),3)}assert.equal(app(null,true).run('S.orders.length'),3)});
+scenario('non-buyer cannot create orders or confirm funding',a=>{a.run('var o=mkDemo(0);S.role="s";A.new()');assert.notEqual(a.run("$('#modal').style.display"),'flex');a.run('S.role="b";A.fund(o.id);S.role="s";A.fok(o.id)');assert.equal(a.run('o.status'),'FUNDING_PENDING')});
+scenario('audit display escapes saved text instead of inserting markup',a=>{a.run('S.audit[0].type="<img src=x>";S.audit[0].prev="<script>"');const html=a.run('tl(S.audit)');assert.ok(!html.includes('<img src=x>'));assert.ok(html.includes('&lt;img src=x&gt;'))});
